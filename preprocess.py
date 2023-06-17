@@ -5,9 +5,10 @@ import numpy as np
 import pandas as pd
 import cv2
 import dicomsdl as dicom
-from tqdm.autonotebook import tqdm
+from tqdm.notebook import tqdm
 from joblib import Parallel, delayed
 from glob import glob
+from pathlib import Path
 
 
 class CreateDicomDf():
@@ -138,22 +139,7 @@ class MammoPreprocessorBase:
             else img[y1:y2, x1:x2]
         )
 
-    #https://towardsdatascience.com/can-you-find-the-breast-tumours-part-2-of-3-1d43840707fc
-    def _remove_wlines(self, img, l=0.01, r=0.01, u=0.04, d=0.04):
-        nrows, ncols = img.shape
-
-        # Get the start and end rows and columns
-        l_crop = int(ncols * l)
-        r_crop = int(ncols * (1 - r))
-        u_crop = int(nrows * u)
-        d_crop = int(nrows * (1 - d))
-
-        return img[u_crop:d_crop, l_crop:r_crop]
-
     def _remove_background(self, img, remove_wlines=True):
-
-        if remove_wlines:
-            img = self._remove_wlines(img) 
 
         # Binarize image to remove noise and find the largest contour
         bin_img = self._binarize(img)
@@ -225,27 +211,28 @@ class MammoPreprocessorCBISDDSM(MammoPreprocessorBase):
         self.df = self._merge_dfs(mammo_imgs_csv, masks_csv, case_desc_csv)
 
     def preprocess_image(
-        self, path: str, fformat: str = "png", hist_eq_type: bool = True, save: bool = True
+        self, path: str, fformat: str = "png", hist_eq_type: str = "hist_eq", save: bool = True
     ):
         # Use dicomsdl to open dcm files (faster than pydicom)
         img = dicom.open(path).pixelData()
         # Each abnormality has a seperate mask so combine then into one for each image
         labels = self._combine_masks(path)
 
+        img, labels = self._remove_wlines(img, labels)
         img, labels = super()._correct_side(img, labels)
         img = super()._remove_background(img)
         img, labels = super()._crop_roi(img, labels)
         img, labels = super()._resize_to_height(img, self.image_size, labels)
         img, labels = super()._padresize_to_width(img, self.image_size, labels)
-        if hist_eq_type:
-            img = super()._hist_eq(img)
+        if hist_eq_type is not None:
+            img = super()._hist_eq(img, hist_eq_type)
         else:
             img = super()._convert_to_8bit(img)
 
         if save:
             self._save_image(img, path, fformat=fformat, mask=labels)
         else:
-            return img
+            return img, labels
 
     def _save_image(self, img, path, fformat: str, mask=None):
         """
@@ -267,6 +254,18 @@ class MammoPreprocessorCBISDDSM(MammoPreprocessorBase):
             save_path = os.path.join(dir_path, fname_mask)
             cv2.imwrite(save_path, mask)
 
+    #https://towardsdatascience.com/can-you-find-the-breast-tumours-part-2-of-3-1d43840707fc
+    def _remove_wlines(self, img, mask=None, l=0.01, r=0.01, u=0.04, d=0.04):
+        nrows, ncols = img.shape
+
+        # Get the start and end rows and columns
+        l_crop = int(ncols * l)
+        r_crop = int(ncols * (1 - r))
+        u_crop = int(nrows * u)
+        d_crop = int(nrows * (1 - d))
+
+        return (img[u_crop:d_crop, l_crop:r_crop], mask[u_crop:d_crop, l_crop:r_crop]) if mask is not None else img[u_crop:d_crop, l_crop:r_crop]
+    
     def _create_save_path(self, img_path):
         # Create a folder from patient id
         patient_folder = re.search("_(P_[0-9]+)_", img_path).group(1)
@@ -277,23 +276,28 @@ class MammoPreprocessorCBISDDSM(MammoPreprocessorBase):
         return save_path
 
     def _combine_masks(self, path):
-        image_info = self.df.loc[self.df.full_img_fname == path]
+        
+        path = Path(path)
+        
+        image_info = self.df.loc[self.df.full_img_fname == str(path)]
+        if image_info.empty:
+            raise ValueError
 
         labels = 0
         for i in range(image_info.shape[0]):
             mask = image_info.iloc[i]
             mask_px = (dicom.open(mask.mask_fname).pixelData() / 255).astype(np.uint8)
             # Mask are coded: 1 for benign, 2 for malignant
-            labels += mask_px * mask.pathology
+            labels = np.maximum(labels, mask_px * mask.pathology)
 
         return labels
 
-    def _merge_dfs(self, mammo_imgs_csv, masks_csv, case_desc_csv):
+    def _merge_dfs(self, df_full, df_mask, case_desc_csv):
         
-        if isinstance(mammo_imgs_csv, str):
-            df_full = pd.read_csv(mammo_imgs_csv)
-        if isinstance(masks_csv, str):
-            df_mask = pd.read_csv(masks_csv)
+        if isinstance(df_full, str):
+            df_full = pd.read_csv(df_full)
+        if isinstance(df_mask, str):
+            df_mask = pd.read_csv(df_mask)
         df_mass = pd.read_csv(case_desc_csv)
 
         mass_type = df_full["PatientID"].str.split("_", n=1)[0][0]
